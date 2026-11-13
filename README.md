@@ -82,6 +82,10 @@ The scanner parses DXBC libraries in the read-only data section of the on-disk s
 
 ## Build and checks
 
+To build and package a Windows x64 deployment ZIP with MSVC, run `./package-release.ps1` from PowerShell. The script discovers the installed x64 C++ toolchain, builds with `/W4 /WX /MT`, runs the HDR policy checks, and writes the ZIP plus SHA-256 checksum to `dist/`. The package includes installation/removal entries and records its source revision; it contains no machine-specific logs or scheduled-task exports. Target PCs do not need MSVC or Python.
+
+After extracting the package, `install.cmd` installs the elevated sign-in task; `remove-startup.cmd` removes it. These entries select RemoteSigned for their PowerShell process only and do not change global execution policy. Internet-marked downloads remain subject to RemoteSigned checks and organizational policy. See `DEPLOY.zh-CN.txt` for deployment and manual setup instructions.
+
 Use an x64 MSVC developer command prompt with a recent Windows SDK:
 
 ```bat

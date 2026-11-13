@@ -1,0 +1,47 @@
+Fuck sRGB：Windows x64 部署说明
+
+适用条件
+- Windows 11 x64，使用本机管理员组内的账户安装。
+- 使用 HDR 的屏幕须在 Windows 设置中开启 HDR。
+- 目标电脑无需 Visual Studio、Python 或另装 C++ 运行时。
+- 程序仅修正 DWM，不修改 Edge、Chrome、WebView2 或系统 DLL 文件。
+
+安装
+1. 完整解压 ZIP，不要在压缩包预览窗口中直接运行。
+2. 双击 install.cmd，允许安装时的 UAC 提示。
+3. 程序复制到 Program Files\Fuck-sRGB，并创建“Fuck-sRGB Gamma2.2”计划任务。
+   任务在当前用户登录后延迟 15 秒以最高权限启动，无主窗口和启动 UAC 提示。
+   安装完成后会立即启动一次，托盘图标保留。
+4. 已开启 HDR 时自动应用 Gamma2.2；未开启任何 HDR 输出时保持 Native。
+   关闭全部 HDR 后，运行中的程序会恢复原生着色器；重新开启后自动恢复 2.2。
+
+脚本执行策略
+- CMD 入口仅为本次 PowerShell 进程选择 RemoteSigned，不更改系统或用户的全局策略。
+- 下载的 ZIP 如果带有 Internet 标记，请确认来源和 SHA-256；如 Windows 阻止脚本，
+  可在 ZIP 的“属性”中按系统提供的方式解除锁定后重新解压。不要关闭防病毒软件。
+- 组织的组策略仍然优先；受管电脑应遵循管理员的部署要求。
+
+不能运行脚本时的手动部署
+1. 用管理员权限将 Fuck-sRGB.exe 复制到 Program Files\Fuck-sRGB。
+2. 打开“任务计划程序”，创建任务“Fuck-sRGB Gamma2.2”。
+3. 使用当前账户，选择“只在用户登录时运行”和“使用最高权限运行”。
+4. 触发器选择该用户登录时，可延迟 15 秒。
+5. 操作直接启动 Program Files\Fuck-sRGB\Fuck-sRGB.exe，参数为 --gamma22 --quiet。
+6. 不设置运行时间限制；若任务已运行，选择不启动新实例。
+
+验证与限制
+- 托盘显示 Gamma2.2，才表示当前已识别到相应 DWM 状态；不能只看进程存在。
+- 日志位于 Program Files\Fuck-sRGB\logs\startup.log。
+  日志中 HDR=2 表示活动 HDR，HDR=1 表示无活动 HDR；actual=1 为 Gamma2.2，actual=0 为 Native。
+- 不同电脑的 Windows/驱动版本可能带来不同着色器。签名不支持时不猜测、不写入，
+  静默启动下请查看日志。HDR/SDR 混合显示及绕过合成的应用仍需在目标机器验证。
+- 仅改变受支持 SDR 输入的传递曲线，不等于校准显示器；不是所有应用都经过该路径。
+
+停止与移除自启
+1. 若要立即撤销修正，先在托盘选择 Native，再选择 Exit。
+2. 双击 remove-startup.cmd 可删除自启任务；此操作不删除 EXE，也不自动撤销已存在的内存补丁。
+3. 不再使用时，在退出程序后可自行删除 Program Files\Fuck-sRGB 文件夹。
+
+校验
+- SHA256SUMS.txt 列出包内每个交付文件的 SHA-256。
+- SOURCE.txt 记录源代码提交；README.md 提供英文说明和构建方法。

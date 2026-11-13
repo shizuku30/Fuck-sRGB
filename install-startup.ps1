@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$ExecutablePath = (Join-Path $PSScriptRoot 'Fuck-sRGB.exe'),
     [switch]$Remove
 )
@@ -9,11 +9,15 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     # 使用当前 PowerShell 宿主，保留其脚本策略，不切换到可能禁用脚本的旧版宿主。
-    $powershell = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    if ([IO.Path]::GetFileName($powershell) -notin @('pwsh.exe', 'powershell.exe')) {
-        throw 'Run this installer from a PowerShell console.'
+    $powershell = Join-Path $PSHOME 'pwsh.exe'
+    if (!(Test-Path -LiteralPath $powershell)) { $powershell = Join-Path $PSHOME 'powershell.exe' }
+    if (!(Test-Path -LiteralPath $powershell)) { throw 'A PowerShell console host was not found.' }
+    $arguments = @('-NoProfile')
+    $processPolicy = Get-ExecutionPolicy -Scope Process
+    if ($processPolicy -ne 'Undefined') {
+        $arguments += @('-ExecutionPolicy', [string]$processPolicy)
     }
-    $arguments = @('-NoProfile', '-File', ('"' + $PSCommandPath + '"'))
+    $arguments += @('-File', ('"' + $PSCommandPath + '"'))
     if ($Remove) { $arguments += '-Remove' }
     else {
         $source = (Get-Item -LiteralPath $ExecutablePath).FullName
