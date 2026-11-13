@@ -1,4 +1,5 @@
-#include "edge-gamma-core.h"
+#include "tray-core.h"
+#include "hdr-state.h"
 
 constexpr wchar_t title[] = L"Fuck sRGB";
 constexpr wchar_t windowClass[] = L"Codex.SdrGamma.Tray.1";
@@ -13,14 +14,26 @@ constexpr const wchar_t* modes[] = {
 };
 static_assert(ARRAYSIZE(modes) == selectableCount);
 
-enum class HdrState { Unavailable, Inactive, Active };
-
-HdrState detectHdr() noexcept {
+void logMessage(const std::wstring& message) noexcept {
     try {
-        return allActiveDisplaysHdr() ? HdrState::Active : HdrState::Inactive;
-    } catch (...) {
-        return HdrState::Unavailable;
-    }
+        wchar_t executable[32768];
+        const DWORD length = GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+        if (!length || length >= ARRAYSIZE(executable)) return;
+        const auto directory = std::filesystem::path(executable).parent_path() / L"logs";
+        std::filesystem::create_directories(directory);
+        std::ofstream log(directory / L"startup.log", std::ios::app);
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, message.data(),
+            static_cast<int>(message.size()), nullptr, 0, nullptr, nullptr);
+        std::string utf8(bytes, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, message.data(), static_cast<int>(message.size()),
+                            utf8.data(), bytes, nullptr, nullptr);
+        SYSTEMTIME time{};
+        GetLocalTime(&time);
+        char stamp[40];
+        sprintf_s(stamp, "%04u-%02u-%02u %02u:%02u:%02u ", time.wYear, time.wMonth,
+                  time.wDay, time.wHour, time.wMinute, time.wSecond);
+        log << stamp << utf8 << '\n';
+    } catch (...) {}
 }
 
 std::wstring errorText(Failure failure) {
@@ -31,7 +44,9 @@ std::wstring errorText(Failure failure) {
 
 class Tray {
 public:
-    explicit Tray(HINSTANCE instance) : icon_(LoadIconW(instance, MAKEINTRESOURCEW(iconResource))) {
+    explicit Tray(HINSTANCE instance, bool quiet, bool gamma22)
+        : icon_(LoadIconW(instance, MAKEINTRESOURCEW(iconResource))),
+          quiet_(quiet), startGamma22_(gamma22) {
         if (!icon_) fail(L"Load tray icon");
     }
 
@@ -53,11 +68,16 @@ public:
             !ChangeWindowMessageFilterEx(hwnd_, taskbarCreated_, MSGFLT_ALLOW, nullptr))
             fail(L"Connect to the Windows taskbar");
         hdr_ = detectHdr();
-        if (!refresh() && hdr_ == HdrState::Active)
-            MessageBoxW(nullptr, error_.c_str(), title, MB_OK | MB_ICONWARNING);
+        if (!refresh()) report(error_, MB_ICONWARNING);
         if (!addIcon()) fail(L"Add tray icon");
         if (!SetTimer(hwnd_, 1, 2000, nullptr)) fail(L"Start display monitoring");
-        startWork(current_.mode, false);
+        desired_ = startGamma22_ ? Mode::Gamma22 : current_.mode;
+        logMessage(L"Started DWM-only; HDR=" + std::to_wstring(static_cast<unsigned>(hdr_)) +
+                   L"; actual=" + std::to_wstring(index(current_.mode)) +
+                   L"; desired=" + std::to_wstring(index(desired_)));
+        const Mode target = automaticTarget(desired_, hdr_);
+        if (current_.mode != Mode::Unknown && index(target) < selectableCount && target != current_.mode)
+            startWork(target);
 
         MSG msg{};
         int status;
@@ -77,19 +97,22 @@ public:
 private:
     HWND hwnd_{};
     HICON icon_{};
+    const bool quiet_, startGamma22_;
+    Mode desired_ = Mode::Srgb;
+    bool automaticBlocked_ = false;
     UINT taskbarCreated_{};
     Patcher patcher_;
-    EdgeSync edge_{patcher_.session};
     Current current_{};
     Current result_{};
     HdrState hdr_ = HdrState::Unavailable;
     bool busy_ = false;
-    bool switching_ = false;
-    EdgeSyncStatus edgeStatus_{};
-    EdgeSyncStatus edgeResult_{};
-    bool edgeError_ = false, edgeResultError_ = false;
     std::wstring error_, workerError_;
     std::thread worker_;
+
+    void report(const std::wstring& message, UINT icon = MB_ICONERROR) const {
+        logMessage(message);
+        if (!quiet_) MessageBoxW(nullptr, message.c_str(), title, MB_OK | icon);
+    }
 
     static LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         if (message == WM_NCCREATE) {
@@ -114,17 +137,11 @@ private:
         const wchar_t* status = L"Checking DWM";
         if (hdr_ == HdrState::Inactive) status = L"HDR inactive";
         else if (hdr_ == HdrState::Unavailable) status = L"HDR status unavailable";
-        else if (switching_) status = L"Applying gamma";
+        else if (busy_) status = L"Applying gamma";
         else if (!error_.empty()) status = L"DWM verification failed";
         else if (index(current_.mode) < selectableCount) status = modes[index(current_.mode)];
         else if (current_.mode == Mode::LegacyGamma26) status = L"Legacy gamma active";
-        const wchar_t* edge = L"";
-        if (hdr_ == HdrState::Active) {
-            if (edgeError_ || edgeStatus_.skipped) edge = L" | Edge sync incomplete";
-            else if (edgeStatus_.synced) edge = L" | Edge synced";
-            else if (edgeStatus_.waiting) edge = L" | Waiting for Edge GPU";
-        }
-        swprintf_s(info.szTip, L"%ls · %ls%ls", title, status, edge);
+        swprintf_s(info.szTip, L"%ls · %ls", title, status);
     }
 
     bool addIcon() const {
@@ -149,6 +166,8 @@ private:
         const auto state = detectHdr();
         if (hdr_ == state) return;
         hdr_ = state;
+        automaticBlocked_ = false;
+        logMessage(L"HDR state=" + std::to_wstring(static_cast<unsigned>(hdr_)));
         updateTooltip();
     }
 
@@ -174,14 +193,16 @@ private:
         if (active && !busy_ && current_.mode == Mode::Unknown) { refresh(); updateTooltip(); }
         HMENU popup = CreatePopupMenu();
         if (!popup) return;
-        UINT flags = MF_STRING;
-        if (!active || busy_ || current_.mode == Mode::Unknown) flags |= MF_GRAYED;
-        for (UINT i = 0; i < selectableCount; ++i) AppendMenuW(popup, flags, firstMode + i, modes[i]);
-        if (active && index(current_.mode) < selectableCount) {
+        for (UINT i = 0; i < selectableCount; ++i) {
+            UINT flags = MF_STRING;
+            if (!canSelectMode(static_cast<Mode>(i), hdr_, current_.mode, busy_)) flags |= MF_GRAYED;
+            AppendMenuW(popup, flags, firstMode + i, modes[i]);
+        }
+        if (index(current_.mode) < selectableCount) {
             CheckMenuRadioItem(popup, firstMode, firstMode + selectableCount - 1,
                               firstMode + index(current_.mode), MF_BYCOMMAND);
         }
-        if (active && (busy_ || !error_.empty() || current_.mode == Mode::LegacyGamma26)) {
+        if (busy_ || !error_.empty() || current_.mode == Mode::LegacyGamma26) {
             AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(popup, MF_STRING | MF_GRAYED, 0, busy_ ? L"Updating..." :
                         !error_.empty() ? L"DWM verification failed" : L"Select a mode to replace legacy gamma");
@@ -196,19 +217,16 @@ private:
         if (command) PostMessageW(hwnd_, WM_COMMAND, command, 0);
     }
 
-    void startWork(Mode mode, bool changeDwm) {
+    void startWork(Mode mode) {
         if (busy_) return;
         const auto before = current_;
         busy_ = true;
-        switching_ = changeDwm;
         workerError_.clear();
-        if (changeDwm) updateTooltip();
+        updateTooltip();
         try {
-            worker_ = std::thread([this, mode, before, changeDwm] {
+            worker_ = std::thread([this, mode, before] {
                 result_ = before;
-                edgeResult_ = {};
-                edgeResultError_ = false;
-                if (changeDwm && detectHdr() == HdrState::Active) {
+                if (mode == Mode::Srgb || detectHdr() == HdrState::Active) {
                     try {
                         result_ = patcher_.set(mode);
                     } catch (const Failure& error) {
@@ -217,26 +235,23 @@ private:
                         workerError_ = L"Could not apply the gamma mode.";
                     }
                 }
-                if (workerError_.empty()) {
-                    try {
-                        edgeResult_ = edge_.sync(detectHdr() == HdrState::Active ? result_.mode : Mode::Srgb);
-                    } catch (...) {
-                        edgeResultError_ = true;
-                    }
-                }
                 PostMessageW(hwnd_, doneMessage, 0, 0);
             });
         } catch (...) {
-            busy_ = switching_ = false;
+            busy_ = false;
+            automaticBlocked_ = true;
             updateTooltip();
-            if (changeDwm) MessageBoxW(nullptr, L"Could not start the gamma change.", title, MB_OK | MB_ICONERROR);
+            report(L"Could not start the gamma change.");
         }
     }
 
     void select(Mode mode) {
         refreshHdr();
-        if (hdr_ != HdrState::Active || mode == current_.mode || current_.mode == Mode::Unknown) return;
-        startWork(mode, true);
+        if (!canSelectMode(mode, hdr_, current_.mode, busy_)) return;
+        desired_ = mode;
+        automaticBlocked_ = false;
+        if (mode == current_.mode) return;
+        startWork(mode);
     }
 
     LRESULT onMessage(UINT message, WPARAM wp, LPARAM lp) {
@@ -262,17 +277,17 @@ private:
         case doneMessage:
             if (!worker_.joinable()) return 0;
             worker_.join();
-            busy_ = switching_ = false;
-            edgeStatus_ = edgeResult_;
-            edgeError_ = edgeResultError_;
+            busy_ = false;
             if (workerError_.empty()) {
                 current_ = result_;
                 if (current_.mode != Mode::Unknown) error_.clear();
+                logMessage(L"DWM actual mode=" + std::to_wstring(index(current_.mode)));
                 updateTooltip();
             } else {
                 refresh();
+                automaticBlocked_ = true;
                 updateTooltip();
-                MessageBoxW(nullptr, workerError_.c_str(), title, MB_OK | MB_ICONERROR);
+                report(workerError_);
             }
             return 0;
         case WM_TIMER:
@@ -280,9 +295,16 @@ private:
             if (!busy_) {
                 if (currentDwm(patcher_.session) != current_.pid) {
                     refresh();
+                    automaticBlocked_ = false;
                     updateTooltip();
                 }
-                startWork(current_.mode, false);
+                // 保留用户选择；HDR 暂时关闭时恢复原生，重新开启后再应用。
+                // 校验失败后不循环重启 DWM，须等待状态变化或用户重新选择。
+                const Mode target = automaticTarget(desired_, hdr_);
+                if (!automaticBlocked_ && hdr_ != HdrState::Unavailable &&
+                    index(target) < selectableCount && current_.mode != Mode::Unknown &&
+                    current_.mode != target)
+                    startWork(target);
             }
             return 0;
         case WM_DISPLAYCHANGE:
@@ -306,16 +328,31 @@ private:
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    bool quiet = false;
     try {
+        int count=0;
+        auto args=CommandLineToArgvW(GetCommandLineW(),&count);
+        if (!args) fail(L"Read command line");
+        bool gamma22=false, valid=true;
+        for (int i=1;i<count;++i) {
+            if (wcscmp(args[i],L"--windows-only")==0) {} // 兼容早期 Windows-only 启动命令。
+            else if (wcscmp(args[i],L"--gamma22")==0) gamma22=true;
+            else if (wcscmp(args[i],L"--quiet")==0) quiet=true;
+            else valid=false;
+        }
+        LocalFree(args);
+        if (!valid) fail(L"Supported options: --gamma22 --quiet", ERROR_INVALID_PARAMETER);
         Handle singleton(CreateMutexW(nullptr, FALSE, L"Local\\Codex.SdrGamma.Tray.1"));
         if (!singleton.value) fail(L"Create tray instance lock");
         if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
-        Tray tray(instance);
+        Tray tray(instance,quiet,gamma22);
         return tray.run(instance);
     } catch (const Failure& error) {
-        MessageBoxW(nullptr, errorText(error).c_str(), title, MB_OK | MB_ICONERROR);
+        logMessage(errorText(error));
+        if (!quiet) MessageBoxW(nullptr, errorText(error).c_str(), title, MB_OK | MB_ICONERROR);
     } catch (...) {
-        MessageBoxW(nullptr, L"Could not start the tray application.", title, MB_OK | MB_ICONERROR);
+        logMessage(L"Could not start the tray application.");
+        if (!quiet) MessageBoxW(nullptr, L"Could not start the tray application.", title, MB_OK | MB_ICONERROR);
     }
     return 1;
 }
